@@ -1,0 +1,330 @@
+#!/usr/bin/python3
+
+import getpass
+import os
+import pwd
+import socket
+import subprocess
+import sys
+import time
+
+
+PROGNAME = 'git-rpmbuild'
+FEDORA_SRC_GIT_URL = 'https://src.fedoraproject.org/rpms/{project}.git'
+
+
+def get_data_dir():
+    """Returns the data directory for git-rpmbuild.
+
+    Use a directory under $XDG_DATA_HOME (default ~/.local/share).
+    This directory is used to store the checkout of the Fedora rpm tree.
+    """
+    data_home = os.environ.get('XDG_DATA_HOME')
+    if not data_home:
+        data_home = os.path.expanduser('~/.local/share')
+    data_dir = os.path.join(data_home, PROGNAME)
+    os.makedirs(data_dir, exist_ok=True)
+    return data_dir
+
+
+def get_temp_dir(data_dir):
+    """Creates the tmp directory, if needed."""
+    temp_dir = os.path.join(data_dir, 'tmp')
+    os.makedirs(temp_dir, exist_ok=True)
+    return temp_dir
+
+
+def get_project_name():
+    """Returns the name of the project.
+
+    Get it from the directory of the development tree, which is typically named
+    after the Git repository name from a `git clone`.
+
+    Assumes we're chdir'd to the top of the Git tree.
+    """
+    return os.path.basename(os.getcwd())
+
+
+def chdir_toplevel():
+    """Changes directory to the top level of the Git tree.
+
+    Raises an exception if the current directory is not under a Git tree.
+    """
+    toplevel = subprocess.check_output(
+            ['git', 'rev-parse', '--show-toplevel'],
+            text=True).rstrip()
+    os.chdir(toplevel)
+
+
+def get_fedora_src_dir(data_dir):
+    """Creates the fedora-src directory, if needed."""
+    fedora_src_dir = os.path.join(data_dir, 'fedora-src')
+    os.makedirs(fedora_src_dir, exist_ok=True)
+    return fedora_src_dir
+
+
+def clone_fedora_src_repo(fedora_src_dir, project, *, fast_forward=True):
+    """Clones the Git repository for the Fedora RPM source tree.
+
+    If the directory has already been cloned, pulls from upstream and
+    fast-forwards it (this can be disabled by passing fast_forward=False).
+
+    Returns the path to the Fedora RPM source dir.
+    """
+    rpm_dir = os.path.join(fedora_src_dir, project)
+    if os.path.isdir(rpm_dir):
+        if fast_forward:
+            subprocess.run(
+                    ['git', 'pull', '--ff-only'],
+                    cwd=rpm_dir,
+                    capture_output=True,
+                    text=True,
+                    check=True)
+    else:
+        fedora_src_url = FEDORA_SRC_GIT_URL.format(project=project)
+        subprocess.run(
+                ['git', 'clone', fedora_src_url, project],
+                cwd=fedora_src_dir,
+                capture_output=True,
+                text=True,
+                check=True)
+    return rpm_dir
+
+
+def get_git_user_name():
+    """Returns the user's full name."""
+    try:
+        user_name = subprocess.check_output(
+                ['git', 'config', '--get', 'user.name'],
+                text=True).rstrip()
+    except subprocess.CalledProcessError:
+        login = getpass.getuser()
+        gecos = pwd.getpwnam(login).pw_gecos
+        user_name = gecos.split(',')[0]
+        if not user_name:
+            user_name = login
+    return user_name
+
+
+def get_git_user_email():
+    """Returns the user's e-mail address."""
+    try:
+        user_email = subprocess.check_output(
+                ['git', 'config', '--get', 'user.email'],
+                text=True).rstrip()
+    except subprocess.CalledProcessError:
+        login = getpass.getuser()
+        hostname = socket.gethostname()
+        user_email = f'{login}@{hostname}'
+    return user_email
+
+
+def get_git_describe():
+    """Gets the Git 'describe' string to use as part of the RPM Release field.
+
+    Returns None if not able to find a useful git describe.
+    """
+    try:
+        return subprocess.check_output(
+                ['git', 'describe', '--tags', '--dirty', '--abbrev=12'],
+                text=True).rstrip()
+    except subprocess.CalledProcessError:
+        return None
+
+
+def get_git_branch():
+    """Gets the name of the current Git branch, if one is available.
+
+    Returns an empty string if not on a git branch (i.e. detached head.)
+    """
+    try:
+        return subprocess.check_output(
+                ['git', 'symbolic-ref', '-q', '--short', 'HEAD'],
+                text=True).rstrip()
+    except subprocess.CalledProcessError:
+        return None
+
+
+def get_git_version(describe):
+    """Extracts the version from a git describe string."""
+    version = describe.split('-')[0]
+    if version.startswith('v'):
+        version = version[1:]
+    return version
+
+
+def assemble_rpm_release(describe, branch):
+    """Assembles a string to use as Release: in the RPM.
+
+    Start with a timestamp, so that the built packages have increasing versions
+    and upgrading will pick up the latest one built.
+
+    Then include the information from the Git describe, if available.
+
+    And the information of the Git branch, if one is checked out.
+
+    Finally, include %{?dist} to include a distribution tag if one is set.
+
+    Args:
+      describe: The git describe output.
+      branch: The name of the git branch.
+    """
+    fields = [time.strftime('%Y%m%d%H%M%S')]
+    if describe:
+        fields.append(describe.replace('-', '_'))
+    if branch:
+        fields.append(branch.replace('-', '_'))
+    return '.'.join(fields) + '%{?dist}'
+
+
+# === Spec file manipulation ===
+#
+# We need to generate a new specfile in order to set the Version,
+# Release and Epoch.
+#
+# Most of this code is adapted from rpmdev-bumpspec, but it's been
+# heavily updated for our specific purposes (rpmdev-bumpspec does not
+# support updating the Epoch and it's somewhat restricted in how to
+# change Release and Version.)
+#
+# Ideally, we should have a better way to do this.
+
+
+class SpecFile:
+    def __init__(self, filename):
+        with open(filename) as f:
+            self.lines = f.readlines()
+
+    def find_epoch(self):
+        """Finds the Epoch, if one is specified.
+
+        Returns None if no epoch is specified in the specfile.
+        """
+        for i in range(len(self.lines)):
+            if self.lines[i].lower().startswith('epoch:'):
+                _, epoch_str = self.lines[i].split()
+                return int(epoch_str)
+        return None
+
+    def new_version(self, version, release, epoch_bump=0):
+        """Updates version and release fields, bumps epoch incrementally.
+
+        Sets version and release to the specified fields.
+
+        Detects which Epoch was in use and bumps it by +epoch_bump.
+
+        Returns the new evr.
+        """
+        orig_epoch = self.find_epoch()
+        if orig_epoch is None:
+            if epoch_bump:
+                new_epoch = epoch_bump
+                self.lines.insert(0, f'Epoch: {new_epoch}\n')
+            else:
+                new_epoch = None
+        else:
+            new_epoch = orig_epoch + epoch_bump
+        for i in range(len(self.lines)):
+            if self.lines[i].lower().startswith('version:'):
+                if version is not None:
+                    self.lines[i] = f'Version: {version}\n'
+            elif self.lines[i].lower().startswith('release:'):
+                self.lines[i] = f'Release: {release}\n'
+            elif self.lines[i].lower().startswith('epoch:'):
+                self.lines[i] = f'Epoch: {new_epoch}\n'
+        evr = f'{version}-{release}'
+        if new_epoch:
+            evr = f'{new_epoch}:{evr}'
+        return evr
+
+    def add_changelog_entry(self, evr, entry, email):
+        """Adds a new changelog entry.
+
+        Args:
+          evr: The {epoch}:{version}-{release} string.
+          entry: The text of the entry to add (including a '-' prefix.)
+          email: The 'Full Name <email@host>' information of the builder.
+        """
+        for i in range(len(self.lines)):
+            if self.lines[i].lower().rstrip() == '%changelog':
+                evr = f' - {evr}' if evr else ''
+                date = time.strftime("%a %b %d %Y")
+                newchangelogentry = f'* {date} {email}{evr}\n{entry}\n\n'
+                self.lines[i] += newchangelogentry
+                return
+
+    def write_file(self, filename):
+        """Writes the modified changelog to a new file."""
+        with open(filename, "w") as f:
+            f.writelines(self.lines)
+
+
+def rpmbuild_package(specfile, fedora_rpm_dir):
+    """Builds the package, runs the `rpmbuild --build-in-place` command.
+
+    Args:
+      specfile: Path to the specfile, with patched evr.
+      fedora_rpm_dir: Path to the Fedora RPM git repo. (Needed for eventual
+                      SourceNNN: files referred to in %build or %install.)
+
+    Some RPM variables are passed through --define's:
+      _sourcedir: Points to the Fedora RPM git repo.
+      _vpath_builddir: Overridden to `build`, to use a fixed `build/`
+                       subdirectory under the development source tree
+                       to execute the build under.
+      debug_package: Overridden to %{nil} to disable generation of
+                     debuginfo and debugsource packages.
+    """
+    cmd = [
+            'rpmbuild', '-bb', '--build-in-place', '--noprep',
+            '--define', f'_sourcedir {fedora_rpm_dir}',
+            '--define', '_vpath_builddir build',
+            '--define', 'debug_package %{nil}',
+            specfile,
+    ]
+    subprocess.run(cmd, check=True)
+
+
+def main(args):
+    # Move to git toplevel directory.
+    chdir_toplevel()
+
+    # Get the local state directory (under ~/.local/share).
+    data_dir = get_data_dir()
+    temp_dir = get_temp_dir(data_dir)
+    fedora_src_dir = get_fedora_src_dir(data_dir)
+
+    # Find the project name.
+    project = get_project_name()
+
+    # Check out or update the Fedora RPM git tree.
+    fedora_rpm_dir = clone_fedora_src_repo(fedora_src_dir, project)
+
+    # Let's find the information for the new RPM version/release.
+    describe = get_git_describe()
+    branch = get_git_branch()
+    version = get_git_version(describe)
+    release = assemble_rpm_release(describe, branch)
+
+    # Let's patch the specfile.
+    orig_specfile = os.path.join(fedora_rpm_dir, f'{project}.spec')
+    sf = SpecFile(orig_specfile)
+    evr = sf.new_version(version, release)
+    changelog_entry = f'- Rebuild from local branch {branch} by {PROGNAME}.'
+    email = f'{get_git_user_name()}@{get_git_user_email()}'
+    sf.add_changelog_entry(evr, changelog_entry, email)
+
+    # Save a new specfile. First remove one if it exists.
+    new_specfile = os.path.join(temp_dir, f'{project}.spec')
+    try:
+        os.remove(new_specfile)
+    except FileNotFoundError:
+        pass
+    sf.write_file(new_specfile)
+
+    # Finally, rpmbuild it!
+    rpmbuild_package(new_specfile, fedora_rpm_dir)
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
